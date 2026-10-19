@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""
+strip-c2pa — Remove C2PA Content Credentials and related AI provenance metadata from images.
+
+Privacy tool for brand assets. Strips:
+- C2PA/JUMBF manifests (APP11 in JPEG, caBX in PNG, C2PA chunks in WebP)
+- EXIF, XMP, IPTC metadata blocks
+- AI generator tags (digitalSourceType, etc.)
+
+Uses exiftool for thorough cleaning. Runs locally, no uploads.
+"""
+
+import sys
+import subprocess
+import argparse
+from pathlib import Path
+from typing import List, Tuple
+
+SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.avif', '.tiff', '.tif'}
+
+def check_exiftool() -> bool:
+    try:
+        subprocess.run(['exiftool', '-ver'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+def strip_file(input_path: Path, output_path: Path, aggressive: bool = False) -> Tuple[bool, str]:
+    """Strip C2PA and metadata using exiftool."""
+    args = ['exiftool', '-overwrite_original']
+    
+    if aggressive:
+        # Strip ALL metadata
+        args.append('-all=')
+    else:
+        # Targeted C2PA/AI metadata removal
+        args.extend([
+            '-C2PA=',           # C2PA manifest
+            '-JUMBF:all=',      # ALL JUMBF containers + nested boxes
+            '-caBX=',           # PNG C2PA chunk
+            '-XMP:all=',        # All XMP
+            '-EXIF:all=',       # All EXIF
+            '-IPTC:all=',       # All IPTC
+            '-ICC_Profile=',    # Color profile (may contain provenance)
+            '-Photoshop:all=',  # Photoshop IRB
+            '-XMP-dc:all=',     # Dublin Core XMP
+            '-XMP-xmp:all=',    # XMP core
+            '-XMP-xmpRights:all=',  # Rights XMP
+            '-XMP-photoshop:all=',  # Photoshop XMP
+            '-XMP-crs:all=',    # Camera Raw XMP
+            '-XMP-tiff:all=',   # TIFF XMP
+            '-XMP-exif:all=',   # EXIF XMP
+            '-XMP-pdf:all=',    # PDF XMP
+            '-XMP-pdfx:all=',   # PDF/X XMP
+            '-XMP-prism:all=',  # PRISM XMP
+            '-XMP-xmpBJ:all=',  # XMP Basic Job Ticket
+            '-XMP-xmpNote:all=', # XMP Notes
+            '-XMP-xmpMM:all=',  # Media Management XMP
+            '-XMP-xmpPLUS:all=', # PLUS XMP
+        ])
+    
+    args.extend(['-o', str(output_path), str(input_path)])
+    
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return True, "OK"
+        else:
+            return False, result.stderr.strip() or "exiftool failed"
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as e:
+        return False, str(e)
+
+def verify_clean(filepath: Path) -> Tuple[bool, List[str]]:
+    """Verify no C2PA/AI metadata remains."""
+    try:
+        result = subprocess.run(
+            ['exiftool', '-G1', '-a', '-s', str(filepath)],
+            capture_output=True, text=True, timeout=30
+        )
+        findings = []
+        output = (result.stdout or '') + (result.stderr or '')
+        for line in output.splitlines():
+            line_lower = line.lower()
+            if any(kw in line_lower for kw in ['c2pa', 'jumbf', 'cabx', 'content.?credential', 
+                                                 'digitalSourceType', 'trainedAlgorithmicMedia',
+                                                 'AIGC', 'aigc', 'ai.generated', 'generated.by']):
+                findings.append(line.strip())
+        return len(findings) == 0, findings
+    except Exception:
+        return False, ["verification failed"]
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Strip C2PA Content Credentials and AI provenance metadata from images',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  strip-c2pa image.jpg                    # Clean to image_clean.jpg
+  strip-c2pa image.jpg -o clean.jpg       # Custom output
+  strip-c2pa -r ./assets/                 # Recursive directory
+  strip-c2pa --aggressive image.jpg       # Strip ALL metadata
+  strip-c2pa --verify-only image.jpg      # Check only
+        '''
+    )
+    parser.add_argument('inputs', nargs='*', help='Image files or directories')
+    parser.add_argument('-o', '--output', help='Output file (single input only)')
+    parser.add_argument('-r', '--recursive', action='store_true', help='Process directories recursively')
+    parser.add_argument('--aggressive', action='store_true', help='Strip ALL metadata (not just C2PA/AI)')
+    parser.add_argument('--verify-only', action='store_true', help='Only verify, do not modify')
+    parser.add_argument('--in-place', action='store_true', help='Overwrite original (creates .bak)')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress progress output')
+    
+    args = parser.parse_args()
+    
+    if not check_exiftool():
+        print("ERROR: exiftool not found. Install: sudo apt install libimage-exiftool-perl", file=sys.stderr)
+        sys.exit(1)
+    
+    # Collect files
+    files: List[Path] = []
+    for inp in args.inputs:
+        p = Path(inp)
+        if p.is_file():
+            if p.suffix.lower() in SUPPORTED_EXTS:
+                files.append(p)
+            else:
+                print(f"SKIP (unsupported): {p}", file=sys.stderr)
+        elif p.is_dir() and args.recursive:
+            for ext in SUPPORTED_EXTS:
+                files.extend(p.rglob(f'*{ext}'))
+                files.extend(p.rglob(f'*{ext.upper()}'))
+        elif not p.exists():
+            print(f"NOT FOUND: {p}", file=sys.stderr)
+    
+    if not files:
+        print("No supported image files found.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Process
+    cleaned = 0
+    failed = 0
+    verified_clean = 0
+    verified_dirty = 0
+    
+    for f in files:
+        if not args.quiet:
+            print(f"Processing: {f}")
+        
+        if args.verify_only:
+            clean, findings = verify_clean(f)
+            if clean:
+                verified_clean += 1
+                if not args.quiet:
+                    print(f"  ✓ Clean")
+            else:
+                verified_dirty += 1
+                if not args.quiet:
+                    print(f"  ✗ Has C2PA/AI metadata: {len(findings)} findings")
+                    for fd in findings[:5]:
+                        print(f"    - {fd}")
+            continue
+        
+        # Determine output path
+        if args.in_place:
+            out_path = f
+            backup = f.with_suffix(f.suffix + '.bak')
+            f.replace(backup)
+            in_path = backup
+        elif args.output and len(files) == 1:
+            out_path = Path(args.output)
+            in_path = f
+        else:
+            out_path = f.with_stem(f.stem + '_clean')
+            in_path = f
+        
+        ok, msg = strip_file(in_path, out_path, args.aggressive)
+        
+        if ok:
+            cleaned += 1
+            if not args.quiet:
+                print(f"  ✓ Cleaned → {out_path}")
+            
+            # Verify
+            clean, findings = verify_clean(out_path)
+            if clean:
+                verified_clean += 1
+                if not args.quiet:
+                    print(f"  ✓ Verified clean")
+            else:
+                verified_dirty += 1
+                if not args.quiet:
+                    print(f"  ⚠ Residual findings: {len(findings)}")
+                    for fd in findings[:5]:
+                        print(f"    - {fd}")
+        else:
+            failed += 1
+            print(f"  ✗ FAILED: {msg}", file=sys.stderr)
+            
+            # Restore backup on failure
+            if args.in_place and backup.exists():
+                backup.replace(f)
+    
+    # Summary
+    if not args.quiet:
+        print()
+        if args.verify_only:
+            print(f"Verified clean: {verified_clean}  |  Has metadata: {verified_dirty}")
+        else:
+            print(f"Cleaned: {cleaned}  |  Failed: {failed}  |  Verified clean: {verified_clean}  |  Residual: {verified_dirty}")
+    
+    sys.exit(0 if failed == 0 else 1)
+
+if __name__ == '__main__':
+    main()

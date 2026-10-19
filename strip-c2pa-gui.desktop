@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Strip C2PA Metadata
+Comment=Remove C2PA Content Credentials and AI provenance metadata from images
+Exec=python3 /home/mpfcs/.local/bin/strip-c2pa-gui
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Photography;
+StartupNotify=true

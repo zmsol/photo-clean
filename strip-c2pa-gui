@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+strip-c2pa-gui — Simple GUI for strip-c2pa
+Drag & drop or browse files/folders to strip C2PA/AI metadata.
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import subprocess
+import threading
+import sys
+from pathlib import Path
+
+TOOL_PATH = Path.home() / '.local' / 'bin' / 'strip-c2pa'
+SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif', '.avif', '.tiff', '.tif'}
+
+class StripC2PAGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Strip C2PA — Remove AI Metadata")
+        self.root.geometry("700x500")
+        self.root.minsize(600, 400)
+        
+        self.files = []
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # Header
+        header = ttk.Frame(self.root, padding=10)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Strip C2PA / Content Credentials", font=('Sans', 14, 'bold')).pack(anchor=tk.W)
+        ttk.Label(header, text="Remove AI provenance metadata from images — local, no upload", 
+                  font=('Sans', 9), foreground='gray').pack(anchor=tk.W)
+        
+        # File list
+        list_frame = ttk.LabelFrame(self.root, text="Files to Process", padding=5)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        columns = ('file', 'status')
+        self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', selectmode='extended')
+        self.tree.heading('file', text='File')
+        self.tree.heading('status', text='Status')
+        self.tree.column('file', width=500)
+        self.tree.column('status', width=120)
+        
+        vsb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        hsb = ttk.Scrollbar(list_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        list_frame.grid_rowconfigure(0, weight=1)
+        list_frame.grid_columnconfigure(0, weight=1)
+        
+        # Buttons
+        btn_frame = ttk.Frame(self.root, padding=10)
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="Add Files…", command=self.add_files).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Add Folder…", command=self.add_folder).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Clear List", command=self.clear_list).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_selected).pack(side=tk.LEFT, padx=5)
+        
+        # Options
+        opt_frame = ttk.LabelFrame(self.root, text="Options", padding=10)
+        opt_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.aggressive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text="Aggressive: strip ALL metadata (not just C2PA/AI)", 
+                        variable=self.aggressive_var).pack(anchor=tk.W)
+        
+        self.inplace_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text="In-place (overwrite originals, creates .bak)", 
+                        variable=self.inplace_var).pack(anchor=tk.W)
+        
+        self.verify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_frame, text="Verify after cleaning (recommended)", 
+                        variable=self.verify_var).pack(anchor=tk.W)
+        
+        # Output folder (when not in-place)
+        out_frame = ttk.Frame(opt_frame)
+        out_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(out_frame, text="Output folder:").pack(side=tk.LEFT)
+        self.out_var = tk.StringVar(value=str(Path.home() / 'Downloads' / 'strip-c2pa-out'))
+        ttk.Entry(out_frame, textvariable=self.out_var, width=50).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(out_frame, text="Browse…", command=self.browse_output).pack(side=tk.LEFT, padx=5)
+        
+        # Action buttons
+        action_frame = ttk.Frame(self.root, padding=10)
+        action_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.run_btn = ttk.Button(action_frame, text="▶ RUN — Strip C2PA Metadata", command=self.run_strip,
+                                   style='Big.Run.TButton')
+        self.run_btn.pack(side=tk.LEFT, padx=10, ipadx=30, ipady=12)
+
+        ttk.Button(action_frame, text="Verify Only (no changes)", command=self.run_verify).pack(side=tk.LEFT, padx=10, ipady=6)
+
+        # Progress
+        self.progress = ttk.Progressbar(self.root, mode='determinate')
+        self.progress.pack(fill=tk.X, padx=10, pady=5)
+
+        # Log
+        log_frame = ttk.LabelFrame(self.root, text="Log", padding=5)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.log = tk.Text(log_frame, height=8, wrap=tk.WORD, font=('Monospace', 9))
+        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_sb = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
+        log_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log.configure(yscrollcommand=log_sb.set)
+
+        # Style
+        style = ttk.Style()
+        style.configure('Big.Run.TButton', font=('Sans', 12, 'bold'))
+        style.configure('Accent.TButton', font=('Sans', 10, 'bold'))
+        
+    def log_msg(self, msg):
+        self.log.insert(tk.END, msg + '\n')
+        self.log.see(tk.END)
+        
+    def add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select Images",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.heic *.heif *.avif *.tiff *.tif"),
+                       ("All Files", "*.*")]
+        )
+        for p in paths:
+            self.add_file(Path(p))
+            
+    def add_folder(self):
+        path = filedialog.askdirectory(title="Select Folder")
+        if not path:
+            return
+        folder = Path(path)
+        for ext in SUPPORTED_EXTS:
+            for f in folder.rglob(f'*{ext}'):
+                self.add_file(f)
+            for f in folder.rglob(f'*{ext.upper()}'):
+                self.add_file(f)
+        self.log_msg(f"Scanned {folder}")
+        
+    def add_file(self, path: Path):
+        if path.suffix.lower() not in SUPPORTED_EXTS:
+            return
+        # Check for duplicates
+        for item in self.tree.get_children():
+            if self.tree.item(item)['values'][0] == str(path):
+                return
+        self.tree.insert('', tk.END, values=(str(path), 'Pending'))
+        
+    def clear_list(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+            
+    def remove_selected(self):
+        for item in self.tree.selection():
+            self.tree.delete(item)
+            
+    def browse_output(self):
+        path = filedialog.askdirectory(title="Select Output Folder")
+        if path:
+            self.out_var.set(path)
+            
+    def run_strip(self):
+        if not self.tree.get_children():
+            messagebox.showwarning("No Files", "Add files or a folder first.")
+            return
+        self.run_tool(strip=True)
+        
+    def run_verify(self):
+        if not self.tree.get_children():
+            messagebox.showwarning("No Files", "Add files or a folder first.")
+            return
+        self.run_tool(strip=False)
+        
+    def run_tool(self, strip=True):
+        self.run_btn.config(state=tk.DISABLED)
+        items = self.tree.get_children()
+        self.progress['maximum'] = len(items)
+        self.progress['value'] = 0
+        
+        def worker():
+            out_dir = Path(self.out_var.get())
+            out_dir.mkdir(parents=True, exist_ok=True)
+            
+            cleaned = 0
+            failed = 0
+            
+            for i, item in enumerate(items):
+                filepath = self.tree.item(item)['values'][0]
+                self.root.after(0, lambda f=filepath, idx=i: self.update_status(f, idx, 'Processing…'))
+                
+                if strip:
+                    if self.inplace_var.get():
+                        cmd = [str(TOOL_PATH), '--in-place']
+                        if self.aggressive_var.get():
+                            cmd.append('--aggressive')
+                        if not self.verify_var.get():
+                            cmd.append('--no-verify')
+                        cmd.append(filepath)
+                    else:
+                        out_path = out_dir / (Path(filepath).stem + '_clean' + Path(filepath).suffix)
+                        cmd = [str(TOOL_PATH), filepath, '-o', str(out_path)]
+                        if self.aggressive_var.get():
+                            cmd.append('--aggressive')
+                        if not self.verify_var.get():
+                            cmd.append('--no-verify')
+                else:
+                    cmd = [str(TOOL_PATH), '--verify-only', filepath]
+                
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    if result.returncode == 0:
+                        cleaned += 1
+                        self.root.after(0, lambda f=filepath, idx=i: self.update_status(f, idx, 'Done'))
+                    else:
+                        failed += 1
+                        err = result.stderr.strip() or result.stdout.strip() or 'Unknown error'
+                        self.root.after(0, lambda f=filepath, idx=i, e=err: self.update_status(f, idx, f'Failed: {e}'))
+                except subprocess.TimeoutExpired:
+                    failed += 1
+                    self.root.after(0, lambda f=filepath, idx=i: self.update_status(f, idx, 'Timeout'))
+                except Exception as e:
+                    failed += 1
+                    self.root.after(0, lambda f=filepath, idx=i, e=str(e): self.update_status(f, idx, f'Error: {e}'))
+                
+                self.root.after(0, lambda v=i+1: self.progress.config(value=v))
+            
+            summary = f"\n{'='*40}\nComplete: {cleaned} cleaned, {failed} failed"
+            if not strip:
+                summary = f"\n{'='*40}\nVerification complete"
+            self.root.after(0, lambda: self.log_msg(summary))
+            self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: messagebox.showinfo("Done", f"Processed {len(items)} files\nCleaned: {cleaned}\nFailed: {failed}"))
+            
+        threading.Thread(target=worker, daemon=True).start()
+        
+    def update_status(self, filepath, idx, status):
+        items = self.tree.get_children()
+        if idx < len(items):
+            item = items[idx]
+            vals = list(self.tree.item(item)['values'])
+            vals[1] = status
+            self.tree.item(item, values=vals)
+        self.log_msg(f"{Path(filepath).name}: {status}")
+
+def main():
+    root = tk.Tk()
+    app = StripC2PAGUI(root)
+    root.mainloop()
+
+if __name__ == '__main__':
+    main()
